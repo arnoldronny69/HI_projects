@@ -1,0 +1,768 @@
+# Topic 5 practical task - nf-core/taxprofiler run in Google Colab
+
+Arnoldas Girdauskas
+
+Health Informatics
+
+---
+This notebook documents a practical run of the nf-core/taxprofiler pipeline using Nextflow in Google Colab. The aim was to test an nf-core workflow, understand its required input files, run a minimal taxonomic profiling analysis, inspect the generated outputs, and record troubleshooting steps encountered during setup and execution. Due to Colab resource limits, the final successful run used a simplified Kraken2-only configuration with FASTA input, while the report also describes why more resource-intensive preprocessing and host-removal steps were disabled.
+
+## Repeating errors
+
+The repeated error came from an older cell still running in `/content/taxprofiler-tutorial` with old parameters (`max_cpus`, `perform_shortread_qc`, `perform_shortread_hostremoval`, Centrifuge, Kaiju). This notebook uses a new working directory and a single executable cell.
+
+This run is intentionally minimal for a 2-CPU Colab runtime:
+
+- input is converted to gzipped FASTA, because nf-core/taxprofiler documentation says FASTA input bypasses preprocessing;
+- only Kraken2 is enabled;
+- short-read QC (`fastp`), Bowtie2 host removal, run merging, Centrifuge, Kaiju, and Taxpasta are disabled;
+- no `max_cpus`, `max_memory`, or `max_time` parameters are placed in `params.json`.
+
+```
+# CODE:
+%%bash
+set -euo pipefail
+
+# HARD RESET OLD ATTEMPTS
+# The repeated failure was caused by old cells/old params being executed from /content/taxprofiler-tutorial. Removing those directories so they cannot be reused
+rm -rf /content/taxprofiler-tutorial \
+       /content/taxprofiler_colab_minimal \
+       /content/taxprofiler_colab_v3_kraken2_only \
+       /content/taxprofiler_final_kraken2_only \
+       /content/taxprofiler_FINAL_kraken2_fasta_20260511 \
+       /content/taxprofiler_COLAB_FINAL_SINGLE_CELL || true
+
+WORK=/content/taxprofiler_COLAB_FINAL_SINGLE_CELL
+mkdir -p "$WORK"
+cd "$WORK"
+
+echo "Working directory for this notebook: $PWD"
+if [[ "$PWD" == "/content/taxprofiler-tutorial" ]]; then
+    echo "ERROR: Wrong working directory. You are still running an old notebook/cell."
+    exit 99
+fi
+
+# Isolate Nextflow from previous cached projects and old params
+export NXF_HOME="$WORK/.nextflow_home"
+export NXF_ASSETS="$NXF_HOME/assets"
+export NXF_WORK="$WORK/work"
+rm -rf "$NXF_HOME" "$NXF_WORK" "$WORK/results" "$WORK/.nextflow" "$WORK/.nextflow.log"* || true
+mkdir -p "$NXF_HOME" "$NXF_ASSETS" "$NXF_WORK"
+
+# SYSTEM SETUP
+apt-get update -qq
+apt-get install -y -qq openjdk-17-jre-headless curl gzip coreutils >/dev/null
+
+# Install/reuse Miniforge in a dedicated Colab path, never /usr/local
+if [[ ! -x /content/miniforge3/bin/conda ]]; then
+    echo "Installing Miniforge into /content/miniforge3 ..."
+    rm -rf /content/miniforge3
+    curl -fsSL -o /tmp/Miniforge3.sh \
+      "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+    bash /tmp/Miniforge3.sh -b -p /content/miniforge3 >/dev/null
+fi
+export PATH="/content/bin:/content/miniforge3/bin:/content/miniforge3/condabin:$PATH"
+
+cat > ~/.condarc <<'YAML'
+channels:
+  - conda-forge
+  - bioconda
+channel_priority: strict
+show_channel_urls: true
+YAML
+
+echo "Conda version: $(conda --version)"
+echo "Conda channels:"
+conda config --show channels
+
+# Nextflow version: nf-schema 2.5.1 requires Nextflow >=25.04.0.
+mkdir -p /content/bin
+export NXF_VER=25.04.8
+if [[ ! -x /content/bin/nextflow ]]; then
+    curl -fsSL https://get.nextflow.io | bash >/dev/null
+    mv nextflow /content/bin/nextflow
+    chmod +x /content/bin/nextflow
+fi
+/content/bin/nextflow -version
+
+# DATA: small nf-core test FASTQ converted to FASTA to bypass preprocessing nf-core tutorial test data, convert one read file to FASTA.gz.
+curl -fsSL -o reads_R1.fastq.gz \
+  https://raw.githubusercontent.com/nf-core/test-datasets/taxprofiler/data/fastq/ERX5474932_ERR5766176_1.fastq.gz
+curl -fsSL -o testdb-kraken2.tar.gz \
+  https://raw.githubusercontent.com/nf-core/test-datasets/taxprofiler/data/database/kraken2/testdb-kraken2.tar.gz
+
+zcat reads_R1.fastq.gz | awk 'NR%4==1 {sub(/^@/,">"); print} NR%4==2 {print}' | gzip -c > reads_as_fasta.fa.gz
+
+cat > samplesheet.csv <<EOF
+sample,run_accession,instrument_platform,fastq_1,fastq_2,fasta
+ERX5474932_FASTA,ERX5474932_FASTA,OXFORD_NANOPORE,,,${WORK}/reads_as_fasta.fa.gz
+EOF
+
+cat > database.csv <<EOF
+tool,db_name,db_params,db_type,db_path
+kraken2,testdb_kraken2,,short;long,${WORK}/testdb-kraken2.tar.gz
+EOF
+
+# Pipeline parameters
+# No max_cpus/max_memory/max_time - taxprofiler 2.0.0 rejects them in Colab.
+cat > params.json <<EOF
+{
+  "input": "${WORK}/samplesheet.csv",
+  "databases": "${WORK}/database.csv",
+  "outdir": "${WORK}/results",
+
+  "run_kraken2": true,
+  "run_centrifuge": false,
+  "run_kaiju": false,
+  "run_bracken": false,
+  "run_krona": false,
+  "run_profile_standardisation": false,
+
+  "perform_shortread_qc": false,
+  "perform_longread_qc": false,
+  "perform_shortread_hostremoval": false,
+  "perform_longread_hostremoval": false,
+  "perform_shortread_complexityfilter": false,
+  "perform_runmerging": false,
+  "save_runmerged_reads": false
+}
+EOF
+
+# Resource config belongs in -c, not params.json. withName regex is included to override process-level labels that otherwise request more CPUs than Colab has.
+cat > colab_resources.config <<'NFCONF'
+process {
+    cpus = 1
+    memory = '4 GB'
+    time = '6h'
+    resourceLimits = [ cpus: 2, memory: '8 GB', time: '6h' ]
+
+    withName: /NFCORE_TAXPROFILER:.*/ {
+        cpus = 1
+        memory = '4 GB'
+        time = '6h'
+    }
+}
+executor {
+    queueSize = 1
+}
+NFCONF
+
+# PREFLIGHT CHECKS: fail before Nextflow if any old/high-CPU parameters appear
+echo "----- samplesheet.csv -----"
+cat samplesheet.csv
+
+echo "----- database.csv -----"
+cat database.csv
+
+echo "----- params.json -----"
+cat params.json
+
+echo "----- colab_resources.config -----"
+cat colab_resources.config
+
+python - <<'PYCHECK'
+import json, pathlib
+p = json.load(open('params.json'))
+for forbidden in ['max_cpus', 'max_memory', 'max_time']:
+    assert forbidden not in p, f'Forbidden stale parameter still present: {forbidden}'
+for key in ['perform_shortread_qc','perform_shortread_hostremoval','perform_runmerging','run_centrifuge','run_kaiju']:
+    assert p.get(key) is False, f'{key} must be false in Colab-safe run, got {p.get(key)!r}'
+assert p.get('run_kraken2') is True, 'run_kraken2 must be true'
+text = pathlib.Path('samplesheet.csv').read_text()
+assert ',,,' in text and '.fa.gz' in text, 'samplesheet must use FASTA input, not FASTQ'
+assert 'taxprofiler-tutorial' not in str(pathlib.Path.cwd()), 'Old workdir detected'
+print('Preflight passed: no stale max_* params, no FASTQ preprocessing, Kraken2-only FASTA run.')
+PYCHECK
+
+# RUN NF-CORE/TAXPROFILER
+/content/bin/nextflow run nf-core/taxprofiler \
+  -r 2.0.0 \
+  -profile conda \
+  -params-file "${WORK}/params.json" \
+  -c "${WORK}/colab_resources.config" \
+  -work-dir "${NXF_WORK}"
+
+# OUTPUT INSPECTION
+echo "----- Result files -----"
+find "$WORK/results" -maxdepth 4 -type f | sort | sed "s#${WORK}/##" | head -200
+
+echo "----- Kraken2 report previews -----"
+find "$WORK/results" -type f \( -name '*report*' -o -name '*.kreport*' -o -name '*.kraken2*' \) -print | while read -r f; do
+    echo "### $f"
+    head -20 "$f" || true
+    echo
+done
+
+
+# OUTPUT:
+Working directory for this notebook: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL
+Installing Miniforge into /content/miniforge3 ...
+Conda version: conda 26.3.2
+Conda channels:
+channels:
+  - conda-forge
+  - bioconda
+
+      N E X T F L O W
+      version 25.04.8 build 5956
+      created 06-10-2025 21:19 UTC 
+      cite doi:10.1038/nbt.3820
+      http://nextflow.io
+
+----- samplesheet.csv -----
+sample,run_accession,instrument_platform,fastq_1,fastq_2,fasta
+ERX5474932_FASTA,ERX5474932_FASTA,OXFORD_NANOPORE,,,/content/taxprofiler_COLAB_FINAL_SINGLE_CELL/reads_as_fasta.fa.gz
+----- database.csv -----
+tool,db_name,db_params,db_type,db_path
+kraken2,testdb_kraken2,,short;long,/content/taxprofiler_COLAB_FINAL_SINGLE_CELL/testdb-kraken2.tar.gz
+----- params.json -----
+{
+  "input": "/content/taxprofiler_COLAB_FINAL_SINGLE_CELL/samplesheet.csv",
+  "databases": "/content/taxprofiler_COLAB_FINAL_SINGLE_CELL/database.csv",
+  "outdir": "/content/taxprofiler_COLAB_FINAL_SINGLE_CELL/results",
+
+  "run_kraken2": true,
+  "run_centrifuge": false,
+  "run_kaiju": false,
+  "run_bracken": false,
+  "run_krona": false,
+  "run_profile_standardisation": false,
+
+  "perform_shortread_qc": false,
+  "perform_longread_qc": false,
+  "perform_shortread_hostremoval": false,
+  "perform_longread_hostremoval": false,
+  "perform_shortread_complexityfilter": false,
+  "perform_runmerging": false,
+  "save_runmerged_reads": false
+}
+----- colab_resources.config -----
+process {
+    cpus = 1
+    memory = '4 GB'
+    time = '6h'
+    resourceLimits = [ cpus: 2, memory: '8 GB', time: '6h' ]
+
+    withName: /NFCORE_TAXPROFILER:.*/ {
+        cpus = 1
+        memory = '4 GB'
+        time = '6h'
+    }
+}
+executor {
+    queueSize = 1
+}
+Preflight passed: no stale max_* params, no FASTQ preprocessing, Kraken2-only FASTA run.
+
+ N E X T F L O W   ~  version 25.04.8
+
+Pulling nf-core/taxprofiler ...
+ downloaded from https://github.com/nf-core/taxprofiler.git
+Launching `https://github.com/nf-core/taxprofiler` [hopeful_bassi] DSL2 - revision: fa1aab0387 [2.0.0]
+
+Downloading plugin nf-schema@2.5.1
+
+------------------------------------------------------
+                                        ,--./,-.
+        ___     __   __   __   ___     /,-._.--~'
+  |\ | |__  __ /  ` /  \ |__) |__         }  {
+  | \| |       \__, \__/ |  \ |___     \`-._,-`-,
+                                        `._,._,'
+  nf-core/taxprofiler 2.0.0
+------------------------------------------------------
+
+Input/output options
+  input              : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/samplesheet.csv
+  databases          : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/database.csv
+  outdir             : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/results
+
+Profiling options
+  run_kraken2        : true
+
+Generic options
+  trace_report_suffix: 2026-05-11_20-34-58
+
+Core Nextflow options
+  revision           : 2.0.0
+  runName            : hopeful_bassi
+  launchDir          : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL
+  workDir            : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work
+  projectDir         : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler
+  userName           : root
+  profile            : conda
+  configFiles        : /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/nextflow.config, /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/colab_resources.config
+
+!! Only displaying parameters that differ from the pipeline defaults !!
+------------------------------------------------------
+
+* The pipeline
+    https://doi.org/10.1101/2023.10.20.563221
+
+* The nf-core framework
+    https://doi.org/10.1038/s41587-020-0439-x
+
+* Software dependencies
+    https://github.com/nf-core/taxprofiler/blob/main/CITATIONS.md
+
+[-        ] NFC…PROFILER:TAXPROFILER:UNTAR -
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+
+[-        ] NFC…PROFILER:TAXPROFILER:UNTAR -
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+
+[-        ] NFC…PROFILER:TAXPROFILER:UNTAR -
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+
+[-        ] NFC…PROFILER:TAXPROFILER:UNTAR -
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+
+[-        ] NFC…PROFILER:TAXPROFILER:UNTAR -
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+
+executor >  local (1)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 0 of 1
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+
+executor >  local (1)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 0 of 1
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+
+executor >  local (1)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[-        ] NFC…:PROFILING:KRAKEN2_KRAKEN2 -
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/kraken2/kraken2/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d5d19e9233b1f598-7e7d9895838289bf8c7576e72c7f2255]
+
+executor >  local (2)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 0 of 1
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/kraken2/kraken2/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d5d19e9233b1f598-7e7d9895838289bf8c7576e72c7f2255]
+
+executor >  local (2)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 0 of 1
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/untar/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d8725a31b1d223eb-4e7a2806bf21778d59d5eb71300de9f9]
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/kraken2/kraken2/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d5d19e9233b1f598-7e7d9895838289bf8c7576e72c7f2255]
+
+executor >  local (2)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC -
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/kraken2/kraken2/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-d5d19e9233b1f598-7e7d9895838289bf8c7576e72c7f2255]
+Creating env using conda: /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/.nextflow_home/assets/nf-core/taxprofiler/modules/nf-core/multiqc/environment.yml [cache /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/work/conda/env-aa83a2f2b9c9cc30-713e4bec227001d62c68db1f8a0b7acd]
+
+
+executor >  local (2)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[-        ] NFC…OFILER:TAXPROFILER:MULTIQC | 0 of 1
+
+
+
+
+executor >  local (3)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[73/c98ac4] NFC…OFILER:TAXPROFILER:MULTIQC | 0 of 1
+
+
+
+executor >  local (3)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[73/c98ac4] NFC…OFILER:TAXPROFILER:MULTIQC | 1 of 1 ✔
+
+executor >  local (3)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[73/c98ac4] NFC…OFILER:TAXPROFILER:MULTIQC | 1 of 1 ✔
+-[nf-core/taxprofiler] Pipeline completed successfully-
+
+executor >  local (3)
+[53/4a29cb] NFC…AR (testdb-kraken2.tar.gz) | 1 of 1 ✔
+[-        ] NFC…ROFILER:TAXPROFILER:FASTQC -
+[a3/9969bd] NFC…|kraken2|ERX5474932_FASTA) | 1 of 1 ✔
+[73/c98ac4] NFC…OFILER:TAXPROFILER:MULTIQC | 1 of 1 ✔
+-[nf-core/taxprofiler] Pipeline completed successfully-
+Completed at: 11-May-2026 20:37:17
+Duration    : 2m 13s
+CPU hours   : (a few seconds)
+Succeeded   : 3
+
+
+----- Result files -----
+results/kraken2/testdb_kraken2/ERX5474932_FASTA_ERX5474932_FASTA_testdb_kraken2.kraken2.kraken2.report.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Class.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Domain.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Family.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Genus.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Kingdom.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Order.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Phylum.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Species.txt
+results/multiqc/multiqc_data/kraken-top-n-plot_Unclassified.txt
+results/multiqc/multiqc_data/llms-full.txt
+results/multiqc/multiqc_data/multiqc_citations.txt
+results/multiqc/multiqc_data/multiqc_data.json
+results/multiqc/multiqc_data/multiqc_general_stats.txt
+results/multiqc/multiqc_data/multiqc_kraken.txt
+results/multiqc/multiqc_data/multiqc.log
+results/multiqc/multiqc_data/multiqc.parquet
+results/multiqc/multiqc_data/multiqc_software_versions.txt
+results/multiqc/multiqc_data/multiqc_sources.txt
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Class-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Class-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Domain-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Domain-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Family-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Family-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Genus-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Genus-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Kingdom-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Kingdom-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Order-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Order-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Phylum-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Phylum-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Species-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Species-pct.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Unclassified-cnt.pdf
+results/multiqc/multiqc_plots/pdf/kraken-top-n-plot_Unclassified-pct.pdf
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Class-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Class-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Domain-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Domain-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Family-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Family-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Genus-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Genus-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Kingdom-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Kingdom-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Order-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Order-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Phylum-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Phylum-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Species-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Species-pct.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Unclassified-cnt.png
+results/multiqc/multiqc_plots/png/kraken-top-n-plot_Unclassified-pct.png
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Class-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Class-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Domain-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Domain-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Family-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Family-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Genus-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Genus-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Kingdom-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Kingdom-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Order-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Order-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Phylum-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Phylum-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Species-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Species-pct.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Unclassified-cnt.svg
+results/multiqc/multiqc_plots/svg/kraken-top-n-plot_Unclassified-pct.svg
+results/multiqc/multiqc_report.html
+results/pipeline_info/execution_report_2026-05-11_20-34-58.html
+results/pipeline_info/execution_timeline_2026-05-11_20-34-58.html
+results/pipeline_info/execution_trace_2026-05-11_20-34-58.txt
+results/pipeline_info/nf_core_taxprofiler_software_mqc_versions.yml
+results/pipeline_info/params_2026-05-11_20-35-23.json
+results/pipeline_info/pipeline_dag_2026-05-11_20-34-58.html
+----- Kraken2 report previews -----
+### /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/results/kraken2/testdb_kraken2/ERX5474932_FASTA_ERX5474932_FASTA_testdb_kraken2.kraken2.kraken2.report.txt
+ 99.98	631902	631902	U	0	unclassified
+  0.02	158	0	R	1	root
+  0.02	158	0	R1	131567	  cellular organisms
+  0.02	158	0	D	2759	    Eukaryota
+  0.02	158	0	D1	33154	      Opisthokonta
+  0.02	150	0	K	33208	        Metazoa
+  0.02	150	0	K1	6072	          Eumetazoa
+  0.02	150	0	K2	33213	            Bilateria
+  0.02	150	0	K3	33511	              Deuterostomia
+  0.02	150	0	P	7711	                Chordata
+  0.02	150	0	P1	89593	                  Craniata
+  0.02	150	0	P2	7742	                    Vertebrata
+  0.02	150	0	P3	7776	                      Gnathostomata
+  0.02	150	0	P4	117570	                        Teleostomi
+  0.02	150	0	P5	117571	                          Euteleostomi
+  0.02	150	0	P6	8287	                            Sarcopterygii
+  0.02	150	0	P7	1338369	                              Dipnotetrapodomorpha
+  0.02	150	0	P8	32523	                                Tetrapoda
+  0.02	150	0	P9	32524	                                  Amniota
+  0.02	150	0	C	40674	                                    Mammalia
+
+### /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/results/multiqc/multiqc_report.html
+<!doctype html>
+<html lang="en">
+  <head>
+    <!--
+  __  __       _ _   _  ___   ____
+ |  \/  |_   _| | |_(_)/ _ \ / ___|
+ | |\/| | | | | | __| | | | | |
+ | |  | | |_| | | |_| | |_| | |___
+ |_|  |_|\__,_|_|\__|_|\__\_\\____|
+
+Abandon hope all ye who enter here..
+http://multiqc.info
+-->
+
+    
+
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+
+### /content/taxprofiler_COLAB_FINAL_SINGLE_CELL/results/pipeline_info/execution_report_2026-05-11_20-34-58.html
+<!DOCTYPE html>
+<!--
+  ~ Copyright 2013-2024, Seqera Labs
+  ~
+  ~ Licensed under the Apache License, Version 2.0 (the "License");
+  ~ you may not use this file except in compliance with the License.
+  ~ You may obtain a copy of the License at
+  ~
+  ~     http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+
+
+# OUTPUT:
+W: Skipping acquire of configured file 'main/source/Sources' as repository 'https://r2u.stat.illinois.edu/ubuntu jammy InRelease' does not seem to provide it (sources.list entry misspelt?)
+[33mNextflow 26.04.0 is available - Please consider updating your version to it[m
+
+```
+
+## Pipeline selected
+
+For this practical task, I selected `nf-core/taxprofiler` version 2.0.0. This is a community nf-core workflow for taxonomic classification and profiling of shotgun metagenomic sequencing data. The pipeline can run multiple profilers, including Kraken2, Centrifuge, Kaiju and others, but each classifier is optional and must be explicitly enabled. According to the nf-core documentation, a classifier runs only when both conditions are met: a compatible database is listed in the database CSV file, and the corresponding `run_<tool>` parameter is enabled. Optional preprocessing steps, such as adapter trimming, host removal and run merging, are also controlled separately through `perform_<step>` parameters.
+
+In the final successful run, I used a minimal Colab configuration of `nf-core/taxprofiler`: FASTA input and Kraken2 profiling. This was chosen after several attempts showed that the full tutorial run requested more CPU resources than were available in the Colab runtime.
+
+## Nextflow and nf-core preparation
+
+Before running the nf-core workflow, I reviewed the basic Nextflow and nf-core concepts needed for the task. The key ideas were that Nextflow pipelines are executed as reproducible workflows, with software environments managed through profiles such as Conda, Docker or Singularity and that nf-core pipelines follow a standardized structure for inputs, parameters, logs and output folders. The practical run used the Conda profile because it is suitable for a Colab Linux environment where Docker is not available by default.
+
+The final run installed Conda through Miniforge, configured the required `conda-forge` and `bioconda` channels, installed a compatible Nextflow version, and then launched `nf-core/taxprofiler` using a parameter file. The run used Nextflow `25.04.8`, because an earlier attempt with Nextflow `24.10.5` failed due to incompatibility with the `nf-schema@2.5.1` plugin required by the pipeline.
+
+## Input data and database
+
+The final successful run used a small tutorial sequencing file from the nf-core/taxprofiler example data. To avoid triggering high-CPU FASTQ preprocessing steps in Colab, the reads were converted from FASTQ format into gzipped FASTA format. This was an important adjustment because FASTA input allows the pipeline to proceed directly to profiling rather than running short-read preprocessing.
+
+The samplesheet used in the final run contained one sample:
+
+```text
+sample,run_accession,instrument_platform,fastq_1,fastq_2,fasta
+ERX5474932_FASTA,ERX5474932_FASTA,OXFORD_NANOPORE,,,reads_as_fasta.fa.gz
+```
+
+The database sheet contained one Kraken2 database:
+
+```text
+tool,db_name,db_params,db_type,db_path
+kraken2,testdb_kraken2,,short;long,testdb-kraken2.tar.gz
+```
+
+Only Kraken2 was enabled in the final parameter file. Other tools and optional steps, including Centrifuge, Kaiju, Bracken, Krona, Taxpasta, short-read QC, host removal and run merging, were disabled to keep the workflow compatible with the 2-CPU Colab environment.
+
+## Final run configuration
+
+The final successful run used a reduced configuration designed specifically for Colab. The most important parameters were:
+
+```json
+{
+  "run_kraken2": true,
+  "run_centrifuge": false,
+  "run_kaiju": false,
+  "run_bracken": false,
+  "run_krona": false,
+  "run_profile_standardisation": false,
+
+  "perform_shortread_qc": false,
+  "perform_longread_qc": false,
+  "perform_shortread_hostremoval": false,
+  "perform_longread_hostremoval": false,
+  "perform_shortread_complexityfilter": false,
+  "perform_runmerging": false,
+  "save_runmerged_reads": false
+}
+```
+
+A small Nextflow resource configuration was also used to limit each process to the available Colab resources. The final run completed successfully, with the main executed processes being database extraction, Kraken2 profiling and MultiQC report generation.
+
+## Pipeline outputs
+
+The successful run produced the standard `results/` directory. The most important output folders were:
+
+```text
+results/kraken2/
+results/multiqc/
+results/pipeline_info/
+```
+
+The `kraken2` output folder contains the main taxonomic classification results. The most important Kraken2 files are the classification output and the Kraken2 report. The report summarizes how many reads were assigned to each taxonomic level and how many reads remained unclassified.
+
+The `multiqc` folder contains the aggregate report, including:
+
+```text
+results/multiqc/multiqc_report.html
+results/multiqc/multiqc_data/
+results/multiqc/multiqc_plots/
+```
+
+MultiQC combines information from the pipeline run into an HTML report and supporting data files. The `pipeline_info` folder contains execution metadata generated during the run, including the execution report, timeline, trace file, pipeline DAG, software versions and the final parameter file. These files are useful because they document how the workflow was run and make the analysis easier to reproduce.
+
+## Results produced
+
+The Kraken2 report showed that the great majority of reads were unclassified using the small tutorial database. The previewed report showed:
+
+```text
+99.98%  unclassified
+0.02%   classified under root/cellular organisms/Eukaryota
+```
+
+More specifically, 631,902 reads were unclassified and 158 reads were classified. The classified fraction included assignments within Eukaryota and Mammalia. This result should not be interpreted as a full biological characterization of the sample, because the tutorial database is intentionally very small and does not represent a comprehensive microbial reference database.
+
+The main conclusion from this run is therefore technical rather than biological: the nf-core/taxprofiler workflow was successfully installed, configured and executed in Colab, and it produced the expected Kraken2, MultiQC and pipeline metadata outputs. The taxonomic result is strongly limited by the small test database.
+
+## Interpretation caveat
+
+The final result should be interpreted cautiously. The small tutorial database is useful for checking whether the pipeline runs correctly, but it is not suitable for realistic taxonomic profiling. A real biological interpretation would require a properly selected and much larger reference database, such as a standard Kraken2 microbial database or a custom database appropriate for the expected organism group.
+
+For this reason, the final run demonstrates pipeline execution and output structure rather than accurate organism identification. The optional additional test using bacterial or fungal reads from GEO/SRA was not performed, because the repeated Colab troubleshooting and the need for suitable reference databases made it too time-consuming for this practical session.
+
+## Troubleshooting
+
+### Colab/Jupyter runtime restart
+
+The first problem was a Colab/Jupyter runtime restart. The log showed that the kernel restarted during the session, with messages related to Jupyter server activity, websocket settings and debugger warnings. This interruption was not caused by a specific nf-core/taxprofiler process. It was a runtime stability issue in the notebook environment. As a result, the session state was lost and installation or setup steps had to be repeated.
+
+This problem showed that Colab is convenient for small demonstrations, but it is less stable than a local machine or server for longer bioinformatics workflows. To reduce the risk of state related problems, later versions of the notebook used a more self-contained setup and recreated the required files before launching the pipeline.
+
+### Boolean parameter validation error
+
+The next issue occurred during pipeline parameter validation. Several parameters, including `perform_shortread_qc`, `perform_shortread_hostremoval`, `perform_runmerging`, `run_kraken2`, `run_kaiju` and `run_centrifuge`, were rejected because they were interpreted as strings rather than booleans. The pipeline expected native boolean values, but the way the parameters were passed caused them to be read as `"true"` strings.
+
+This was solved by moving the parameters into a structured parameter file instead of passing many boolean values directly on the command line. Using a parameter file made the run configuration clearer and reduced ambiguity in how Nextflow and nf-schema interpreted the values.
+
+### Conda channel configuration
+
+Another issue was related to Conda channel order. nf-core pipelines commonly rely on packages from both `conda-forge` and `bioconda`. The failed run reported that only `conda-forge` was configured, whereas the required order included both `conda-forge` and `bioconda`.
+
+This was fixed by writing an explicit `.condarc` file before running the pipeline:
+
+```yaml
+channels:
+  - conda-forge
+  - bioconda
+channel_priority: strict
+show_channel_urls: true
+```
+
+After this change, Conda was able to resolve the nf-core software environments more consistently.
+
+### Nextflow version incompatibility
+
+One failed attempt used Nextflow `24.10.5`. This version was too old for the `nf-schema@2.5.1` plugin used by `nf-core/taxprofiler` version 2.0.0. The error message stated that the plugin required Nextflow `>=25.04.0`.
+
+This was fixed by using Nextflow `25.04.8`, which satisfied the plugin requirement while avoiding use of the newer edge version. After this adjustment, the pipeline launched successfully and passed the plugin compatibility check.
+
+### CPU resource errors from Bowtie2 host removal
+
+The original tutorial configuration enabled host removal with Bowtie2. This failed in Colab because the Bowtie2 index-building process requested 12 CPUs, while the Colab runtime exposed only 2 CPUs. The error was:
+
+```text
+Process requirement exceeds available CPUs -- req: 12; avail: 2
+```
+
+This was a resource scheduling problem rather than a biological or database problem. Host removal is useful in real metagenomic workflows, especially when host contamination is expected, but it was too resource-demanding for this restricted Colab environment. Therefore, host removal was disabled in the final run.
+
+### CPU resource errors from FASTQ preprocessing
+
+Another repeated error came from `fastp`, which was triggered during short-read FASTQ preprocessing. The `fastp` paired-end process requested 6 CPUs, again exceeding the 2 CPUs available in Colab. This caused the workflow to stop before reaching the profiling stage.
+
+The final solution was to avoid short-read FASTQ preprocessing completely. The input reads were converted to gzipped FASTA, and short-read QC/preprocessing was disabled. This allowed the workflow to proceed directly to Kraken2 profiling. This was the most robust solution for Colab because it avoided launching high-CPU optional preprocessing modules.
+
+### Stale notebook cells and old working directory
+
+A major practical issue was that Colab continued to execute an older run cell from a previous notebook version. The repeated errors showed that execution was still happening in:
+
+```text
+/content/taxprofiler-tutorial
+```
+
+This directory contained older parameter files that still enabled `fastp`, Bowtie2 host removal, Centrifuge and Kaiju. Because of this, the same high-CPU failures kept reappearing even after the intended configuration had been changed.
+
+The final notebook solved this by using a new unique working directory and deleting old attempt directories before starting:
+
+```text
+/content/taxprofiler_COLAB_FINAL_SINGLE_CELL
+```
+
+The final notebook also used a single executable cell and printed the working directory, samplesheet, database sheet and parameter file before launching the pipeline. This made it easier to confirm that the correct configuration was being executed.
+
+## Overall experience
+
+The practical task showed that nf-core pipelines are highly structured and reproducible, but that running them in a constrained notebook environment requires careful control of parameters, software versions and computational resources. The final successful run was intentionally minimal, but it still demonstrated the essential workflow: prepare a samplesheet, prepare a database sheet, configure the pipeline, run Nextflow, and inspect the output folders.
+
+The main lesson was that many nf-core/taxprofiler steps are optional and should be enabled only when the runtime environment can support them. In a full server or workstation environment, it would be reasonable to run the complete tutorial with preprocessing, host removal and multiple classifiers. In Colab, a Kraken2-only FASTA run was more appropriate and allowed the pipeline to complete successfully.
+
+## Task completion check
+
+Completed:
+
+- Ran an nf-core pipeline: `nf-core/taxprofiler` v2.0.0.
+- Used Nextflow to execute the workflow.
+- Used nf-core/taxprofiler documentation as the basis for input structure and parameters.
+- Prepared a samplesheet and database sheet.
+- Ran the pipeline successfully in Colab.
+- Reported the input format.
+- Reported the output folders and files.
+- Described the taxonomic result produced by Kraken2.
+- Documented troubleshooting steps and final fixes.
+
+Partially completed or not attempted:
+
+- The optional additional GEO/SRA bacteria or fungus test was not performed. This was reasonable because repeated environment and resource troubleshooting made the additional test too time-consuming for the session.
+- The final biological result should not be treated as a real organism-identification result, because the run used a small tutorial database rather than a comprehensive reference database.
+
+
